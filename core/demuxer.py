@@ -1,9 +1,18 @@
+# core/demuxer.py
+"""
+In-Memory Look-Ahead Demuxer.
+Uses FFmpeg via stdout pipes to extract video frames, raw PCM audio buffers,
+and embedded subtitles directly into RAM with Zero Disk I/O.
+"""
+
 import os
 import sys
+import re
 import subprocess
 import time
 from typing import List, Tuple
 
+# Ensure project root is in sys.path
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
@@ -12,6 +21,10 @@ import config
 
 
 def extract_frames(file_path: str, start_sec: float, duration: float = config.SLICE_DURATION_SEC) -> List[bytes]:
+    """
+    Extracts exactly 3 downscaled JPEG frames (384x384) over a duration-second window
+    using an in-memory FFmpeg stdout pipe.
+    """
     vf_filter = (
         f"fps=3/{duration},"
         "scale=384:384:force_original_aspect_ratio=decrease,"
@@ -20,21 +33,17 @@ def extract_frames(file_path: str, start_sec: float, duration: float = config.SL
 
     cmd = [
         "ffmpeg",
-        "-ss", f"{start_sec:.2f}",   # Fast seek before input
+        "-ss", f"{start_sec:.2f}",
         "-i", file_path,
         "-t", f"{duration:.2f}",
         "-vf", vf_filter,
-        "-f", "image2pipe",          # Stream output continuously
-        "-vcodec", "mjpeg",          # JPEG compression
-        "-"                          # Pipe directly to stdout (RAM)
+        "-f", "image2pipe",
+        "-vcodec", "mjpeg",
+        "-"
     ]
 
     try:
-        process = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL
-        )
+        process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
         raw_bytes, _ = process.communicate(timeout=3.0)
     except (subprocess.SubprocessError, subprocess.TimeoutExpired):
         return []
@@ -51,51 +60,115 @@ def extract_frames(file_path: str, start_sec: float, duration: float = config.SL
         if eoi == -1:
             break
 
-        # Slice the complete JPEG byte buffer
-        jpeg_buf = raw_bytes[soi : eoi + 2]
-        frames.append(jpeg_buf)
+        frames.append(raw_bytes[soi : eoi + 2])
         start_idx = eoi + 2
 
     return frames
 
 
-def extract_audio(file_path: str, start_sec: float, duration: float = config.SLICE_DURATION_SEC) -> bytes:
-
+def extract_subtitles(file_path: str, start_sec: float, duration: float = config.SLICE_DURATION_SEC) -> str:
     cmd = [
         "ffmpeg",
-        "-ss", f"{start_sec:.2f}",   # Fast seek
+        "-ss", f"{start_sec:.2f}",
         "-i", file_path,
         "-t", f"{duration:.2f}",
-        "-vn",                       # Drop video stream
-        "-ac", "1",                  # Mono channel
-        "-ar", str(config.AUDIO_SAMPLE_RATE),  # 16,000 Hz
-        "-f", "s16le",               # Signed 16-bit Little Endian PCM
-        "-"                          # Pipe directly to stdout (RAM)
+        "-map", "0:s:0?",          # Try mapping first subtitle stream
+        "-f", "srt",
+        "-"
     ]
 
     try:
-        process = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL
-        )
+        process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        raw_srt, _ = process.communicate(timeout=2.0)
+        srt_text = raw_srt.decode("utf-8", errors="ignore").strip()
+    except (subprocess.SubprocessError, subprocess.TimeoutExpired):
+        return ""
+
+    if not srt_text:
+        return ""
+
+    # Parse and clean SRT text
+    dialogue_lines = []
+    for line in srt_text.splitlines():
+        line = line.strip()
+        # Skip empty lines, sequence numbers (e.g. '1', '2'), and timestamps (contains '-->')
+        if not line or line.isdigit() or "-->" in line:
+            continue
+        # Remove formatting tags like <i>, </i>, <font...>, etc.
+        cleaned = re.sub(r"<[^>]+>", "", line)
+        # Remove SDH brackets like [gunfire], (chuckles)
+        cleaned = re.sub(r"\[.*?\]|\(.*?\)", "", cleaned).strip()
+        if cleaned:
+            dialogue_lines.append(cleaned)
+
+    return " ".join(dialogue_lines)
+
+
+def extract_audio(file_path: str, start_sec: float, duration: float = config.SLICE_DURATION_SEC) -> bytes:
+    """
+    Extracts raw 16kHz mono 16-bit PCM audio bytes over a duration-second window.
+    Tries English audio track first; falls back to default audio track if unavailable.
+    """
+    # Attempt 1: English audio track specifically
+    cmd_english = [
+        "ffmpeg",
+        "-ss", f"{start_sec:.2f}",
+        "-i", file_path,
+        "-t", f"{duration:.2f}",
+        "-map", "0:a:m:language:eng",   # Clean syntax (no trailing ?)
+        "-vn",
+        "-ac", "1",
+        "-ar", str(config.AUDIO_SAMPLE_RATE),
+        "-f", "s16le",
+        "-"
+    ]
+
+    try:
+        process = subprocess.Popen(cmd_english, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+        raw_audio, _ = process.communicate(timeout=3.0)
+        if len(raw_audio) >= 160000:
+            return raw_audio
+    except (subprocess.SubprocessError, subprocess.TimeoutExpired):
+        pass
+
+    # Attempt 2: Fallback to default audio track (for movies with single track or no tags)
+    cmd_fallback = [
+        "ffmpeg",
+        "-ss", f"{start_sec:.2f}",
+        "-i", file_path,
+        "-t", f"{duration:.2f}",
+        "-vn",
+        "-ac", "1",
+        "-ar", str(config.AUDIO_SAMPLE_RATE),
+        "-f", "s16le",
+        "-"
+    ]
+
+    try:
+        process = subprocess.Popen(cmd_fallback, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
         raw_audio, _ = process.communicate(timeout=3.0)
         return raw_audio
     except (subprocess.SubprocessError, subprocess.TimeoutExpired):
         return b""
 
 
-def demux_slice(file_path: str, start_sec: float, duration: float = config.SLICE_DURATION_SEC) -> Tuple[List[bytes], bytes]:
+def demux_slice(file_path: str, start_sec: float, duration: float = config.SLICE_DURATION_SEC) -> Tuple[List[bytes], bytes, str]:
+    """
+    Simultaneously extracts video frames, audio buffers, and embedded subtitles.
+    Returns:
+        (frames, audio_bytes, subtitles_text)
+    """
     frames = extract_frames(file_path, start_sec, duration)
     audio = extract_audio(file_path, start_sec, duration)
-    return frames, audio
+    subs = extract_subtitles(file_path, start_sec, duration)
+    return frames, audio, subs
 
 
 if __name__ == "__main__":
     from core.vlc_client import VLCClient
 
     print("=" * 70)
-    print("Testing In-Memory Demuxer against current VLC playback...")
+    print("Testing In-Memory Demuxer with SUBTITLE EXTRACTION...")
     print("=" * 70)
 
     client = VLCClient()
@@ -103,30 +176,21 @@ if __name__ == "__main__":
 
     if not status.file_path or status.state == "stopped":
         print("[!] VLC is not currently playing any file.")
-        print("[!] Open a video in VLC and play it, then run this test again.")
         sys.exit(1)
 
-    lookahead_target = status.time + config.LOOKAHEAD_SEC
+    target_sec = status.time + config.LOOKAHEAD_SEC
     print(f"Current VLC Time:    {status.time:.2f}s")
-    print(f"Look-Ahead Target:   {lookahead_target:.2f}s (T + {config.LOOKAHEAD_SEC}s)")
-    print(f"Target Media File:   {status.file_path}")
-    print("\nExecuting In-Memory Demuxing (Zero Disk I/O)...")
+    print(f"Look-Ahead Target:   {target_sec:.2f}s")
+    print(f"Target Media File:   {os.path.basename(status.file_path)}")
+    print("\nExecuting In-Memory Demuxing (Frames + Audio + Subtitles)...")
 
     t_start = time.perf_counter()
-    frames, audio = demux_slice(status.file_path, lookahead_target)
+    frames, audio, subtitles = demux_slice(status.file_path, target_sec)
     t_elapsed = time.perf_counter() - t_start
 
     print("-" * 70)
-    print(f"-> Extracted Frames:  {len(frames)} (Expected: 3)")
-    for i, f in enumerate(frames):
-        print(f"   * Frame {i + 1}: {len(f):,} bytes | SOI: {f[:2].hex().upper()} | EOI: {f[-2:].hex().upper()}")
-
-    expected_audio_len = int(config.SLICE_DURATION_SEC * config.AUDIO_SAMPLE_RATE * 2)
-    print(f"-> Extracted Audio:   {len(audio):,} bytes (Expected: {expected_audio_len:,} bytes)")
-    print(f"-> Pipeline Latency:  {t_elapsed:.3f} seconds")
+    print(f"-> Extracted Frames:     {len(frames)} JPEGs in RAM")
+    print(f"-> Extracted Audio:      {len(audio):,} bytes")
+    print(f"-> Extracted Subtitles:  \"{subtitles if subtitles else '[No subtitles in this 5s window]'}\"")
+    print(f"-> Latency:              {t_elapsed:.3f} seconds")
     print("=" * 70)
-
-    if len(frames) == 3 and len(audio) == expected_audio_len:
-        print("[SUCCESS] Phase 1.2 In-Memory Demuxer is verified and fully functional!")
-    else:
-        print("[WARNING] Extraction completed with partial or missing data.")

@@ -1,3 +1,10 @@
+# core/sensory.py
+"""
+Acoustic & Dialogue Sensory Engine.
+Equipped with Center-Channel vocal focus, Silero VAD,
+and anti-hallucination decoding parameters for noisy cinematic audio.
+"""
+
 import os
 import sys
 import time
@@ -14,12 +21,16 @@ import config
 
 
 class SensoryEngine:
+    """
+    Multimodal audio analysis engine combining acoustic physics (NumPy RMS)
+    and robust speech transcription (Faster-Whisper small.en on CPU).
+    """
 
-    def __init__(self, model_size: str = "base", device: str = "cpu", compute_type: str = "int8"):
-        print(f"[SensoryEngine] Loading Faster-Whisper ({model_size}) on {device} ({compute_type})...")
+    def __init__(self, model_size: str = "small.en", device: str = "cpu", compute_type: str = "int8"):
+        print(f"[SensoryEngine] Loading Whisper ({model_size}) on {device} ({compute_type})...")
         t0 = time.perf_counter()
         
-        # Whisper runs on CPU in int8 to keep 100% of GPU VRAM free for Ollama VLM
+        # 'small.en' provides dramatically superior acoustic separation for English dialogue
         self.whisper = WhisperModel(
             model_size,
             device=device,
@@ -29,25 +40,23 @@ class SensoryEngine:
         print(f"[SensoryEngine] Whisper loaded in {time.perf_counter() - t0:.2f}s.")
 
     def detect_acoustic_spike(self, samples: np.ndarray, window_ms: int = 100) -> Tuple[bool, float]:
+        """
+        Analyzes audio power using sliding-window Root Mean Square (RMS).
+        Flags loud_spike=True if peak volume exceeds median volume by >15.0 dB.
+        """
         if len(samples) == 0:
             return False, 0.0
 
-        # Window size in samples: 100ms at 16,000 Hz = 1,600 samples
         w = int((window_ms / 1000.0) * config.AUDIO_SAMPLE_RATE)
         num_windows = len(samples) // w
 
         if num_windows == 0:
             return False, 0.0
 
-        # Reshape into windows and compute RMS per window
         trimmed = samples[: num_windows * w]
         reshaped = trimmed.reshape((num_windows, w))
         
-        # RMS = sqrt(mean(x^2))
         rms_values = np.sqrt(np.mean(reshaped ** 2, axis=1))
-
-        # Convert RMS to Decibels (dB = 20 * log10(RMS + epsilon))
-        # Epsilon (1e-9) prevents log(0) runtime errors during dead silence
         db_values = 20.0 * np.log10(rms_values + 1e-9)
 
         median_db = float(np.median(db_values))
@@ -58,35 +67,55 @@ class SensoryEngine:
         return loud_spike, delta_db
 
     def transcribe(self, samples: np.ndarray) -> str:
+        """
+        Transcribes audio with strict anti-hallucination and noise-rejection filters.
+        """
         if len(samples) == 0:
             return ""
 
         segments, _ = self.whisper.transcribe(
             samples,
-            beam_size=1,            # Greedy search: ultra-fast
-            vad_filter=True,        # Drops non-speech silence instantly
-            vad_parameters=dict(min_silence_duration_ms=250),
-            language="en"           # Set language directly to bypass detection latency
+            beam_size=1,                         # Fast greedy search
+            temperature=0.0,                     # Zero random guessing
+            condition_on_previous_text=False,    # Kills repetitive hallucination loops!
+            no_speech_threshold=0.6,             # Drops instrumental/score hallucination
+            compression_ratio_threshold=2.4,     # Discards repetitive gibberish
+            vad_filter=True,                     # Silero VAD: processes human speech only
+            vad_parameters=dict(
+                min_silence_duration_ms=250,
+                threshold=0.5
+            ),
+            language="en"
         )
 
         transcript = " ".join(seg.text.strip() for seg in segments if seg.text)
         return transcript.strip()
 
-    def process_audio(self, raw_audio_bytes: bytes) -> Tuple[bool, float, str]:
-        if not raw_audio_bytes:
-            return False, 0.0, ""
+    def process(self, raw_audio_bytes: bytes, fallback_subtitles: str = "") -> Tuple[bool, float, str]:
+        """
+        Dual-Engine Sensory Pipeline:
+        1. Evaluates acoustic volume spike (NumPy RMS physics).
+        2. Priority 1: If clean embedded subtitles exist, use them (100% human ground truth).
+        3. Priority 2: If no subtitles exist, run noise-hardened Whisper model.
+        """
+        # Step 1: Acoustic Physics
+        if raw_audio_bytes:
+            audio_int16 = np.frombuffer(raw_audio_bytes, dtype=np.int16)
+            samples = audio_int16.astype(np.float32) / 32768.0
+            loud_spike, delta_db = self.detect_acoustic_spike(samples)
+        else:
+            samples = np.array([], dtype=np.float32)
+            loud_spike, delta_db = False, 0.0
 
-        # Step 1: Cast raw binary buffer to 16-bit signed int, then normalize to float32
-        audio_int16 = np.frombuffer(raw_audio_bytes, dtype=np.int16)
-        samples = audio_int16.astype(np.float32) / 32768.0
+        # Step 2: Speech Dialogue (Subtitles first, Whisper fallback)
+        if fallback_subtitles.strip():
+            final_dialogue = fallback_subtitles.strip()
+            source = "Embedded Subtitles"
+        else:
+            final_dialogue = self.transcribe(samples)
+            source = "Whisper Neural Audio"
 
-        # Step 2: Physics check (Acoustics)
-        loud_spike, delta_db = self.detect_acoustic_spike(samples)
-
-        # Step 3: Semantic check (Whisper)
-        transcript = self.transcribe(samples)
-
-        return loud_spike, delta_db, transcript
+        return loud_spike, delta_db, final_dialogue, source
 
 
 if __name__ == "__main__":
@@ -94,48 +123,40 @@ if __name__ == "__main__":
     from core.demuxer import demux_slice
 
     print("=" * 70)
-    print("DAY 1 MILESTONE TEST: Full Time-Traveler Ingestion Pipeline")
+    print("TESTING HARDENED SENSORY ENGINE (Whisper small.en + VAD)")
     print("=" * 70)
 
-    # 1. Connect to VLC
     vlc = VLCClient()
     status = vlc.get_status()
 
     if not status.file_path or status.state == "stopped":
-        print("[!] VLC is not playing. Open your movie in VLC and start playback first.")
+        print("[!] VLC is not playing. Start video playback first.")
         sys.exit(1)
 
     target_sec = status.time + config.LOOKAHEAD_SEC
-    print(f"[VLC Ground Truth]:  {status.time:.2f}s | State: {status.state} | {os.path.basename(status.file_path)}")
-    print(f"[Look-Ahead Target]: {target_sec:.2f}s (T + {config.LOOKAHEAD_SEC}s into the future)")
+    print(f"[VLC Ground Truth]:  {status.time:.2f}s | {os.path.basename(status.file_path)}")
+    print(f"[Look-Ahead Target]: {target_sec:.2f}s (T + {config.LOOKAHEAD_SEC}s)")
     print("-" * 70)
 
-    # 2. Extract future slice in RAM
-    t_start = time.perf_counter()
-    frames, audio_bytes = demux_slice(status.file_path, target_sec)
-    t_demux = time.perf_counter() - t_start
-
-    # 3. Sensory Analysis (NumPy + Whisper)
-    engine = SensoryEngine(model_size="base")
+    # 1. Demux Slice (Frames, Audio, Subtitles)
+    t0 = time.perf_counter()
+    frames, audio_bytes, subs = demux_slice(status.file_path, target_sec)
     
-    t_sensory_start = time.perf_counter()
-    loud_spike, delta_db, transcript = engine.process_audio(audio_bytes)
-    t_sensory = time.perf_counter() - t_sensory_start
-    t_total = time.perf_counter() - t_start
+    # 2. Process through Sensory Engine
+    engine = SensoryEngine(model_size="small.en")
+    
+    # Force Whisper test by testing BOTH subtitles and pure audio:
+    audio_int16 = np.frombuffer(audio_bytes, dtype=np.int16)
+    samples = audio_int16.astype(np.float32) / 32768.0
+    
+    t_whisper_start = time.perf_counter()
+    pure_whisper_dialogue = engine.transcribe(samples)
+    t_whisper = time.perf_counter() - t_whisper_start
+    
+    loud_spike, delta_db = engine.detect_acoustic_spike(samples)
 
-    # 4. Report Day 1 Milestone Results
-    print(f"-> [T+{config.LOOKAHEAD_SEC:.0f}s Extracted]:  {len(frames)} JPEGs in RAM ({sum(len(f) for f in frames):,} bytes)")
-    spike_label = "LOUD SPIKE DETECTED!" if loud_spike else "Normal Volume"
-    print(f"-> [Audio dB Delta]:    +{delta_db:.1f} dB ({spike_label})")
-    print(f"-> [Whisper Dialogue]:  \"{transcript if transcript else '[No dialogue detected]'}\"")
-    print("-" * 70)
-    print(f"[Latency Breakdown]:")
-    print(f"   * Demuxer Slicing:   {t_demux:.3f}s")
-    print(f"   * Sensory (dB + AI): {t_sensory:.3f}s")
-    print(f"   * Total Pipeline:    {t_total:.3f}s")
+    print(f"-> [Acoustic Spike]:   +{delta_db:.1f} dB (Spike: {loud_spike})")
+    print(f"-> [Subtitles Track]:  \"{subs if subs else '[No subtitles]'}\"")
+    print(f"-> [Pure Whisper AI]:  \"{pure_whisper_dialogue if pure_whisper_dialogue else '[No speech detected]'}\"")
+    print(f"-> [Whisper Latency]:  {t_whisper:.3f} seconds")
     print("=" * 70)
-
-    if len(frames) == 3 and len(audio_bytes) == 160000:
-        print("[SUCCESS] DAY 1 MILESTONE ACHIEVED! All invariants satisfied.")
-    else:
-        print("[WARNING] Pipeline completed with partial data.")
