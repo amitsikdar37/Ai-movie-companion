@@ -91,7 +91,7 @@ class SensoryEngine:
         transcript = " ".join(seg.text.strip() for seg in segments if seg.text)
         return transcript.strip()
 
-    def process(self, raw_audio_bytes: bytes, fallback_subtitles: str = "") -> Tuple[bool, float, str]:
+    def process(self, raw_audio_bytes: bytes, fallback_subtitles: str = "") -> Tuple[bool, float, str, str]:
         """
         Dual-Engine Sensory Pipeline:
         1. Evaluates acoustic volume spike (NumPy RMS physics).

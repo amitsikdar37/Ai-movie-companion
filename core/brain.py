@@ -45,6 +45,9 @@ class ReactionPayload(BaseModel):
         description="True ONLY if this scene contains a genuine emotional peak, jump scare, plot twist, or comedy punchline. False during normal scenes."
     )
     trigger_offset_sec: float = Field(
+        default=0.0,
+        ge=0.0,
+        le=5.0,
         description="Precise offset in seconds (0.0 to 5.0) within this 5-second slice where the reaction must occur."
     )
     emote: EmoteType = Field(
@@ -107,7 +110,8 @@ class CognitiveBrain:
         self,
         jpeg_frames: List[bytes],
         dialogue: str,
-        loud_spike: bool
+        loud_spike: bool,
+        update_memory: bool = True
     ) -> Optional[ReactionPayload]:
         """
         Evaluates a 5-second multimodal slice and returns a validated ReactionPayload.
@@ -154,17 +158,18 @@ class CognitiveBrain:
             # Shield 2: If Ollama returned empty string, fallback gracefully
             if not raw_json:
                 print("[CognitiveBrain] VLM returned empty content, invoking fallback...")
-                return self._fallback_evaluate(dialogue_text, loud_spike)
+                return self._fallback_evaluate(dialogue_text, loud_spike, update_memory)
 
             payload = ReactionPayload.model_validate_json(raw_json)
-            self.rolling_memory = payload.updated_plot_memory
+            if update_memory:
+                self.rolling_memory = payload.updated_plot_memory
             return payload
 
         except Exception as e:
             print(f"[CognitiveBrain Warning]: {e}. Invoking dialogue fallback.")
-            return self._fallback_evaluate(dialogue_text, loud_spike)
+            return self._fallback_evaluate(dialogue_text, loud_spike, update_memory)
 
-    def _fallback_evaluate(self, dialogue: str, loud_spike: bool) -> ReactionPayload:
+    def _fallback_evaluate(self, dialogue: str, loud_spike: bool, update_memory: bool = True) -> ReactionPayload:
         """Fallback evaluation using dialogue and acoustic spike without images."""
         try:
             user_prompt = (
@@ -185,7 +190,8 @@ class CognitiveBrain:
             raw_json = response["message"]["content"].strip()
             if raw_json:
                 payload = ReactionPayload.model_validate_json(raw_json)
-                self.rolling_memory = payload.updated_plot_memory
+                if update_memory:
+                    self.rolling_memory = payload.updated_plot_memory
                 return payload
         except Exception:
             pass

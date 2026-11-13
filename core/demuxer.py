@@ -45,7 +45,11 @@ def extract_frames(file_path: str, start_sec: float, duration: float = config.SL
     try:
         process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
         raw_bytes, _ = process.communicate(timeout=3.0)
-    except (subprocess.SubprocessError, subprocess.TimeoutExpired):
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait()
+        return []
+    except subprocess.SubprocessError:
         return []
 
     frames: List[bytes] = []
@@ -81,7 +85,11 @@ def extract_subtitles(file_path: str, start_sec: float, duration: float = config
         process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
         raw_srt, _ = process.communicate(timeout=2.0)
         srt_text = raw_srt.decode("utf-8", errors="ignore").strip()
-    except (subprocess.SubprocessError, subprocess.TimeoutExpired):
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait()
+        return ""
+    except subprocess.SubprocessError:
         return ""
 
     if not srt_text:
@@ -126,9 +134,12 @@ def extract_audio(file_path: str, start_sec: float, duration: float = config.SLI
     try:
         process = subprocess.Popen(cmd_english, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
         raw_audio, _ = process.communicate(timeout=3.0)
-        if len(raw_audio) >= 160000:
+        if len(raw_audio) > 0:
             return raw_audio
-    except (subprocess.SubprocessError, subprocess.TimeoutExpired):
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait()
+    except subprocess.SubprocessError:
         pass
 
     # Attempt 2: Fallback to default audio track (for movies with single track or no tags)
@@ -148,7 +159,11 @@ def extract_audio(file_path: str, start_sec: float, duration: float = config.SLI
         process = subprocess.Popen(cmd_fallback, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
         raw_audio, _ = process.communicate(timeout=3.0)
         return raw_audio
-    except (subprocess.SubprocessError, subprocess.TimeoutExpired):
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait()
+        return b""
+    except subprocess.SubprocessError:
         return b""
 
 

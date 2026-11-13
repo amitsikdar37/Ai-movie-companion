@@ -3,7 +3,7 @@ import sys
 import time
 import queue
 from typing import Optional, Tuple
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 # Ensure project root is in sys.path
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -16,9 +16,9 @@ from core.brain import ReactionPayload
 
 @dataclass(order=True)
 class ScheduledItem:
-    """Helper wrapper to ensure thread-safe priority queue sorting by timestamp."""
+    """Helper wrapper to ensure thread-safe priority queue sorting by timestamp without comparing payload."""
     timestamp: float
-    payload: ReactionPayload
+    payload: ReactionPayload = field(compare=False)
 
 
 class ReactionScheduler:
@@ -26,7 +26,7 @@ class ReactionScheduler:
 
     def __init__(self, cooldown_seconds: float = 20.0):
         # Priority queue automatically orders items by the lowest timestamp first
-        self.queue: queue.PriorityQueue[Tuple[float, ReactionPayload]] = queue.PriorityQueue()
+        self.queue: queue.PriorityQueue[ScheduledItem] = queue.PriorityQueue()
         self.cooldown_seconds = cooldown_seconds
         self.last_reaction_vlc_time = -999.0
 
@@ -41,7 +41,7 @@ class ReactionScheduler:
         # Target second = start of the 5s slice + offset inside the slice
         target_timestamp = slice_start_time + payload.trigger_offset_sec
 
-        self.queue.put((target_timestamp, payload))
+        self.queue.put(ScheduledItem(timestamp=target_timestamp, payload=payload))
         mins, secs = divmod(int(target_timestamp), 60)
         print(f"[Scheduler] Reaction queued for VLC second {mins:02d}:{secs:02d} ({payload.emote.value.upper()}: \"{payload.bubble_text}\")")
 
@@ -57,13 +57,15 @@ class ReactionScheduler:
         if self.queue.empty():
             return None
 
-        # Peek at earliest scheduled timestamp without removing
-        earliest_timestamp, payload = self.queue.queue[0]
+        # Peek at earliest scheduled item without removing
+        earliest_item = self.queue.queue[0]
+        earliest_timestamp = earliest_item.timestamp
 
         # Is it time to react?
         if vlc_current_time >= earliest_timestamp:
             # Pop item from queue
-            _, payload = self.queue.get()
+            item = self.queue.get()
+            payload = item.payload
 
             # Guard 1: Freshness check (if reaction is older than 1.5s, drop it)
             if vlc_current_time - earliest_timestamp > 1.5:

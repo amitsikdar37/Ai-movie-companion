@@ -25,21 +25,20 @@ class PlaybackState:
 
 
 def uri_to_path(raw_uri: str) -> str:
+    """
+    Converts a VLC URI like 'file:///D:/Movies/My%20Movie.mkv'
+    into a clean, OS-valid file path like 'D:\\Movies\\My Movie.mkv'.
+    Safe against filenames with '#' or '?' and existing Windows drive paths.
+    """
     if not raw_uri:
         return ""
-    
-    # 1. Decode percent-encoding (e.g. %20 -> space)
-    unquoted = urllib.parse.unquote(raw_uri)
-    
-    # 2. Extract path component
-    parsed = urllib.parse.urlparse(unquoted)
-    path = parsed.path if parsed.path else unquoted
-    
-    # 3. Strip leading slash before Windows drive letters (e.g. '/D:/' -> 'D:/')
-    if path.startswith("/") and len(path) > 2 and path[2] == ":":
-        path = path[1:]
-        
-    return os.path.normpath(path)
+    if raw_uri.startswith("file://"):
+        parsed = urllib.parse.urlparse(raw_uri)
+        path = urllib.parse.unquote(parsed.path)
+        if path.startswith("/") and len(path) > 2 and path[2] == ":":
+            path = path[1:]
+        return os.path.normpath(path)
+    return os.path.normpath(urllib.parse.unquote(raw_uri))
 
 
 def find_uri_in_playlist(node: Dict[str, Any], target_id: str) -> Optional[str]:

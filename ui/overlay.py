@@ -101,6 +101,7 @@ class DesktopCompanionOverlay(QWidget):
         self.bubble_label = QLabel(self)
         self.bubble_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.bubble_label.setWordWrap(True)
+        self.bubble_label.setMaximumWidth(220)
         self.bubble_label.setStyleSheet("""
             QLabel {
                 background-color: rgba(255, 255, 255, 245);
@@ -121,6 +122,11 @@ class DesktopCompanionOverlay(QWidget):
         bubble_shadow.setOffset(2, 4)
         self.bubble_label.setGraphicsEffect(bubble_shadow)
         self.bubble_label.hide()  # Hidden by default until reaction
+
+        # Reusable auto-revert timer (prevents overlapping singleShot cuts)
+        self.revert_timer = QTimer(self)
+        self.revert_timer.setSingleShot(True)
+        self.revert_timer.timeout.connect(self.revert_to_idle)
 
         # 2. Avatar Character Label
         self.avatar_label = QLabel(self)
@@ -181,8 +187,8 @@ class DesktopCompanionOverlay(QWidget):
         self.bubble_label.show()
         self._position_bottom_right()
 
-        # Auto-revert back to idle after 3.0 seconds
-        QTimer.singleShot(3000, self.revert_to_idle)
+        # Reset or start 3.0 second auto-revert timer
+        self.revert_timer.start(3000)
 
     def revert_to_idle(self):
         """Reverts the avatar to idle state and hides the speech bubble."""
