@@ -1,8 +1,10 @@
 import math
 import os
 import random
+import re
 import sys
-from typing import Dict
+import time
+from typing import Dict, List, Tuple
 
 from PyQt6.QtCore import QPointF, QRectF, Qt, QTimer, pyqtSignal, pyqtSlot
 from PyQt6.QtGui import (
@@ -31,9 +33,8 @@ EMOTE_NAMES = [
 
 class DesktopCompanionOverlay(QWidget):
     """
-    60/30 FPS anti-aliased 2D cartoon companion overlay.
-    Loads 32-bit RGBA PNGs from assets/ if present, otherwise renders a
-    cel-shaded procedural 2D mascot with blinking, breathing, and bounce physics.
+    30 FPS 2D cartoon companion overlay with expression-specific body kinematics
+    and multi-frame sprite alternation (e.g., laugh.png + laugh_2.png).
     """
 
     reaction_signal = pyqtSignal(str, str)
@@ -43,27 +44,24 @@ class DesktopCompanionOverlay(QWidget):
         os.makedirs(ASSETS_DIR, exist_ok=True)
 
         self.click_through = click_through
-        self.sprites: Dict[str, QPixmap] = {}
+        self.sprites: Dict[str, List[QPixmap]] = {}
         self.current_emote = "idle"
         self.bubble_text = ""
         self.show_bubble = False
 
-        # Animation & physics state
-        self.phase = 0.0
-        self.bounce_velocity = 0.0
-        self.bounce_offset = 0.0
-        self.squash = 0.0
+        # Timing & animation state
+        self.start_time = time.perf_counter()
+        self.emote_start_time = self.start_time
         self.is_blinking = False
-        self.blink_countdown = random.randint(70, 140)
+        self.blink_countdown = random.randint(75, 150)
 
         self._init_window_flags()
         self._load_png_sprites()
 
-        # Fixed canvas ample enough for speech bubble + mascot + shadow
-        self.setFixedSize(260, 250)
+        self.setFixedSize(270, 260)
         self._position_bottom_right()
 
-        # Auto-revert timer (reusable single-shot)
+        # Reusable single-shot timer to revert reaction back to idle
         self.revert_timer = QTimer(self)
         self.revert_timer.setSingleShot(True)
         self.revert_timer.timeout.connect(self.revert_to_idle)
@@ -89,13 +87,38 @@ class DesktopCompanionOverlay(QWidget):
         self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground, True)
 
     def _load_png_sprites(self):
-        """Loads true 32-bit RGBA .png sprites if placed in assets/."""
-        for emote in EMOTE_NAMES:
-            png_path = os.path.join(ASSETS_DIR, f"{emote}.png")
-            if os.path.exists(png_path):
-                pix = QPixmap(png_path)
+        """
+        Case-insensitively loads single PNGs (e.g. 'Scared.png') AND
+        animation sequences ('laugh.png', 'laugh_2.png', 'laugh_3.png').
+        """
+        if not os.path.isdir(ASSETS_DIR):
+            return
+
+        files = sorted(os.listdir(ASSETS_DIR))
+        grouped: Dict[str, List[Tuple[int, str]]] = {e: [] for e in EMOTE_NAMES}
+
+        for fname in files:
+            lower = fname.lower()
+            if not lower.endswith(".png"):
+                continue
+            stem = lower[:-4]
+            match = re.match(r"^([a-z]+)(?:_(\d+))?$", stem)
+            if not match:
+                continue
+            base_emote, frame_idx = match.group(1), match.group(2)
+            if base_emote in grouped:
+                order = int(frame_idx) if frame_idx is not None else 1
+                grouped[base_emote].append((order, os.path.join(ASSETS_DIR, fname)))
+
+        for emote, items in grouped.items():
+            items.sort(key=lambda x: x[0])
+            loaded = []
+            for _, path in items:
+                pix = QPixmap(path)
                 if not pix.isNull():
-                    self.sprites[emote] = pix
+                    loaded.append(pix)
+            if loaded:
+                self.sprites[emote] = loaded
 
     def _position_bottom_right(self):
         """Docks the character directly onto the top edge of the Windows taskbar."""
@@ -108,250 +131,203 @@ class DesktopCompanionOverlay(QWidget):
     def trigger_reaction(self, emote: str, bubble_text: str):
         target = emote.lower()
         self.current_emote = target if target in EMOTE_NAMES else "idle"
+        self.emote_start_time = time.perf_counter()
         self.bubble_text = bubble_text.strip().upper()
         self.show_bubble = bool(self.bubble_text)
-
-        # Trigger squash-and-stretch hop
-        self.bounce_velocity = -11.0
-        self.squash = 0.16
 
         self.revert_timer.start(3200)
         self.update()
 
     def revert_to_idle(self):
         self.current_emote = "idle"
+        self.emote_start_time = time.perf_counter()
         self.show_bubble = False
         self.bubble_text = ""
         self.update()
 
     def _tick_animation(self):
-        self.phase += 0.12
-
-        # Spring physics for reaction hop
-        if self.bounce_offset < 0.0 or self.bounce_velocity != 0.0:
-            self.bounce_offset += self.bounce_velocity
-            self.bounce_velocity += 1.4  # Gravity
-            if self.bounce_offset >= 0.0:
-                self.bounce_offset = 0.0
-                self.bounce_velocity = 0.0
-                self.squash = -0.12  # Landing squish
-
-        # Decay squash-and-stretch back to 0
-        self.squash *= 0.82
-
-        # Natural eye blink scheduler
+        # Natural blink scheduler for idle state (uses idle_2.png)
         self.blink_countdown -= 1
         if self.blink_countdown <= 0:
             if not self.is_blinking:
                 self.is_blinking = True
-                self.blink_countdown = 4  # Blink duration (~130ms)
+                self.blink_countdown = 4  # ~130ms blink duration
             else:
                 self.is_blinking = False
                 self.blink_countdown = random.randint(80, 160)
 
         self.update()
 
+    def _get_active_sprite(self, emote_t: float) -> QPixmap:
+        """Selects the active frame for the current emote (supports multi-frame mouth/blink)."""
+        frames = self.sprites.get(self.current_emote) or self.sprites.get("idle")
+        if not frames and self.sprites:
+            frames = next(iter(self.sprites.values()))
+        if not frames:
+            return QPixmap()
+
+        if len(frames) == 1:
+            return frames[0]
+
+        # During idle, frame[1] acts as the blink frame
+        if self.current_emote in ("idle", "neutral"):
+            return frames[1] if self.is_blinking else frames[0]
+
+        # During active reactions, alternate frames at ~10 FPS or ~6 FPS
+        fps = 10.0 if self.current_emote in ("laugh", "scared", "hype") else 6.0
+        idx = int(emote_t * fps) % len(frames)
+        return frames[idx]
+
+    def _compute_kinematics(self, global_t: float, emote_t: float) -> Tuple[float, float, float, float, float]:
+        """
+        Returns expression-specific body motion:
+        (dx, dy, scale_x, scale_y, angle_deg)
+        """
+        e = self.current_emote
+
+        if e == "laugh":
+            # Rapid rhythmic belly-laugh pulses + joyful head rocking
+            pulse = abs(math.sin(emote_t * 14.0))
+            dx = math.sin(emote_t * 7.0) * 2.0
+            dy = -pulse * 6.5
+            scale_x = 1.0 + pulse * 0.04
+            scale_y = 1.0 - pulse * 0.045
+            angle = math.sin(emote_t * 7.0) * 4.5
+            return dx, dy, scale_x, scale_y, angle
+
+        if e == "hype":
+            # Energetic double-pump fist bounces
+            pulse = abs(math.sin(emote_t * 11.5))
+            dx = math.sin(emote_t * 5.75) * 3.0
+            dy = -pulse * 12.0
+            scale_x = 1.0 - pulse * 0.04
+            scale_y = 1.0 + pulse * 0.07
+            angle = math.sin(emote_t * 11.5) * 5.0
+            return dx, dy, scale_x, scale_y, angle
+
+        if e == "scared":
+            # High-frequency terror shiver + crouched posture
+            shiver = math.sin(emote_t * 58.0) * 4.2
+            tremor = math.cos(emote_t * 46.0) * 2.0
+            return shiver, 2.0, 0.95, 0.93, tremor
+
+        if e == "shock":
+            # Sharp upward recoil/stretch (0..0.18s), then wide-eyed freeze
+            if emote_t < 0.18:
+                k = math.sin((emote_t / 0.18) * math.pi)
+                return 0.0, -16.0 * k, 1.0 - 0.08 * k, 1.0 + 0.13 * k, -4.0 * k
+            after_jolt = math.sin(emote_t * 32.0) * max(0.0, 1.5 - emote_t)
+            return after_jolt, -2.0, 1.0, 1.02, -2.5
+
+        if e == "cry":
+            # Heavy downward slump + periodic sobbing hiccups
+            sob = max(0.0, math.sin(emote_t * 8.5)) ** 4
+            dx = math.sin(emote_t * 17.0) * 1.2 * sob
+            dy = 3.5 - sob * 4.5
+            scale_x = 1.04 - sob * 0.03
+            scale_y = 0.93 + sob * 0.05
+            angle = math.sin(emote_t * 4.25) * 2.5
+            return dx, dy, scale_x, scale_y, angle
+
+        if e == "cringe":
+            # Pulls back and leans away with awkward wince shudder
+            ease = min(1.0, emote_t / 0.15)
+            wince = math.sin(emote_t * 36.0) * 1.6
+            return (7.0 * ease) + wince, 1.5 * ease, 0.95, 0.96, 6.5 * ease
+
+        if e == "confused":
+            # Smooth curious head tilt that holds while pondering
+            ease = min(1.0, emote_t / 0.22)
+            breath = math.sin(global_t * 2.2) * 0.012
+            return -2.0 * ease, -1.5 * ease, 1.0 - breath, 1.0 + breath, -9.0 * ease
+
+        # Default 'idle' or 'neutral': calm, slow chest breathing
+        breath = math.sin(global_t * 2.2)
+        sway = math.sin(global_t * 1.1) * 1.2
+        return 0.0, 0.0, 1.0 - breath * 0.012, 1.0 + breath * 0.016, sway
+
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         painter.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform, True)
 
-        cx = self.width() / 2.0
-        ground_y = self.height() - 18.0
+        now = time.perf_counter()
+        global_t = now - self.start_time
+        emote_t = now - self.emote_start_time
 
-        # Idle breathing wave
-        breath = math.sin(self.phase) * 2.5
-        char_y = ground_y + self.bounce_offset + breath
+        dx, dy, scale_x, scale_y, angle = self._compute_kinematics(global_t, emote_t)
+
+        cx = (self.width() / 2.0) + dx
+        ground_y = self.height() - 16.0
+        char_y = ground_y + dy
 
         # 1. Grounded Contact Shadow
-        shadow_scale = max(0.55, 1.0 + (self.bounce_offset / 80.0))
-        shadow_w = 96.0 * shadow_scale
-        shadow_grad = QRadialGradient(QPointF(cx, ground_y + 4), shadow_w / 2.0)
-        shadow_grad.setColorAt(0.0, QColor(0, 0, 0, 135))
+        lift = max(0.0, -dy)
+        shadow_scale = max(0.6, (1.0 - lift / 70.0) * scale_x)
+        shadow_w = 108.0 * shadow_scale
+        shadow_grad = QRadialGradient(QPointF(cx, ground_y + 2), shadow_w / 2.0)
+        shadow_grad.setColorAt(0.0, QColor(0, 0, 0, 130))
         shadow_grad.setColorAt(1.0, QColor(0, 0, 0, 0))
         painter.setBrush(QBrush(shadow_grad))
         painter.setPen(Qt.PenStyle.NoPen)
-        painter.drawEllipse(QRectF(cx - shadow_w / 2.0, ground_y - 4, shadow_w, 16))
+        painter.drawEllipse(QRectF(cx - shadow_w / 2.0, ground_y - 5, shadow_w, 14))
 
-        # 2. Render Custom PNG Sprite OR Procedural 2D Cartoon Mascot
-        if self.current_emote in self.sprites or "idle" in self.sprites:
-            pix = self.sprites.get(self.current_emote, self.sprites["idle"])
-            scale_x = 1.0 - self.squash
-            scale_y = 1.0 + self.squash
-            draw_w = 135.0 * scale_x
-            draw_h = 135.0 * scale_y
-            target_rect = QRectF(cx - draw_w / 2.0, char_y - draw_h, draw_w, draw_h)
+        # 2. Draw Character Sprite Pivoted at Bottom-Center
+        pix = self._get_active_sprite(emote_t)
+        draw_h = 142.0 * scale_y
+
+        if not pix.isNull():
+            aspect = pix.width() / max(1.0, float(pix.height()))
+            draw_w = 142.0 * aspect * scale_x
+
+            painter.save()
+            painter.translate(cx, char_y)
+            painter.rotate(angle)
+            target_rect = QRectF(-draw_w / 2.0, -draw_h, draw_w, draw_h)
             painter.drawPixmap(target_rect, pix, QRectF(pix.rect()))
-        else:
-            self._draw_procedural_mascot(painter, cx, char_y)
+            painter.restore()
 
-        # 3. Comic Speech Bubble with Tail
+        # 3. Comic Speech Bubble Tracked Above Head
         if self.show_bubble and self.bubble_text:
-            self._draw_speech_bubble(painter, cx, char_y - 128.0)
-
-    def _draw_procedural_mascot(self, painter: QPainter, cx: float, bottom_y: float):
-        """Draws a clean cel-shaded 2D mascot with headphones and dynamic facial rigs."""
-        scale_x = 1.0 - self.squash
-        scale_y = 1.0 + self.squash
-        w = 112.0 * scale_x
-        h = 104.0 * scale_y
-        left = cx - w / 2.0
-        top = bottom_y - h
-
-        outline = QPen(QColor("#1E1B2E"), 3.2)
-        outline.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
-        painter.setPen(outline)
-
-        # Little cat/fox ears behind headphones
-        for side in (-1, 1):
-            ear = QPainterPath()
-            ear.moveTo(cx + side * (w * 0.22), top + 16)
-            ear.lineTo(cx + side * (w * 0.42), top - 14)
-            ear.lineTo(cx + side * (w * 0.44), top + 28)
-            ear.closeSubpath()
-            painter.setBrush(QColor("#FF9EBB"))
-            painter.drawPath(ear)
-
-        # Headband arc
-        painter.setBrush(Qt.BrushStyle.NoBrush)
-        painter.setPen(QPen(QColor("#2B2D42"), 6.0, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
-        painter.drawArc(QRectF(left - 4, top - 8, w + 8, h * 0.85), 20 * 16, 140 * 16)
-
-        # Main Chibi Head (Warm Cream Cel-Shaded)
-        painter.setPen(outline)
-        painter.setBrush(QColor("#FFF8F0"))
-        painter.drawRoundedRect(QRectF(left, top, w, h), 44.0, 42.0)
-
-        # Headphone Earcups (Coral Accent)
-        painter.setBrush(QColor("#FF5D8F"))
-        painter.drawRoundedRect(QRectF(left - 11, top + h * 0.34, 16, 34), 8, 8)
-        painter.drawRoundedRect(QRectF(left + w - 5, top + h * 0.34, 16, 34), 8, 8)
-
-        # Rosy Cheeks
-        painter.setPen(Qt.PenStyle.NoPen)
-        cheek_color = QColor("#FF4D6D" if self.current_emote in ("shock", "hype", "laugh") else "#FF8FA3")
-        cheek_color.setAlpha(150)
-        painter.setBrush(cheek_color)
-        eye_y = top + h * 0.48
-        painter.drawEllipse(QRectF(cx - 36, eye_y + 8, 16, 9))
-        painter.drawEllipse(QRectF(cx + 20, eye_y + 8, 16, 9))
-
-        # Eyes & Expressions
-        painter.setPen(outline)
-        self._draw_face_expression(painter, cx, eye_y)
-
-    def _draw_face_expression(self, painter: QPainter, cx: float, eye_y: float):
-        e = self.current_emote
-
-        # Eyes
-        if self.is_blinking and e == "idle":
-            for side in (-1, 1):
-                painter.drawLine(QPointF(cx + side * 22 - 7, eye_y), QPointF(cx + side * 22 + 7, eye_y))
-        elif e in ("laugh", "hype"):
-            # Happy curved arcs (^ ^)
-            for side in (-1, 1):
-                ex = cx + side * 22
-                path = QPainterPath()
-                path.moveTo(ex - 8, eye_y + 3)
-                path.quadTo(ex, eye_y - 8, ex + 8, eye_y + 3)
-                painter.setBrush(Qt.BrushStyle.NoBrush)
-                painter.drawPath(path)
-        elif e in ("cringe", "scared"):
-            # > < squeezed eyes
-            for side in (-1, 1):
-                ex = cx + side * 22
-                painter.drawLine(QPointF(ex - 6, eye_y - 5), QPointF(ex + 6, eye_y))
-                painter.drawLine(QPointF(ex + 6, eye_y), QPointF(ex - 6, eye_y + 5))
-        else:
-            # Big glossy anime eyes with white specular highlights
-            r = 8.5 if e == "shock" else 7.0
-            for side in (-1, 1):
-                ex = cx + side * 22
-                painter.setBrush(QColor("#1E1B2E"))
-                painter.drawEllipse(QRectF(ex - r, eye_y - r, r * 2, r * 2))
-                painter.setPen(Qt.PenStyle.NoPen)
-                painter.setBrush(QColor("#FFFFFF"))
-                painter.drawEllipse(QRectF(ex - r * 0.45, eye_y - r * 0.55, r * 0.65, r * 0.65))
-                painter.setPen(QPen(QColor("#1E1B2E"), 3.0))
-
-        # Eyebrows
-        for side in (-1, 1):
-            bx = cx + side * 22
-            tilt = -4 * side if e in ("shock", "scared", "cry") else (4 * side if e == "cringe" else 0)
-            y_off = -15 if e == "shock" else -12
-            painter.drawLine(QPointF(bx - 7, eye_y + y_off - tilt), QPointF(bx + 7, eye_y + y_off + tilt))
-
-        # Mouth
-        mouth_y = eye_y + 18
-        if e in ("shock", "scared"):
-            painter.setBrush(QColor("#FF5D8F"))
-            painter.drawEllipse(QRectF(cx - 6, mouth_y - 4, 12, 14))
-        elif e in ("laugh", "hype"):
-            painter.setBrush(QColor("#FF5D8F"))
-            path = QPainterPath()
-            path.moveTo(cx - 10, mouth_y - 2)
-            path.lineTo(cx + 10, mouth_y - 2)
-            path.quadTo(cx, mouth_y + 13, cx - 10, mouth_y - 2)
-            painter.drawPath(path)
-        elif e in ("cringe", "confused"):
-            path = QPainterPath()
-            path.moveTo(cx - 9, mouth_y + 2)
-            path.quadTo(cx - 3, mouth_y - 3, cx, mouth_y + 2)
-            path.quadTo(cx + 3, mouth_y + 6, cx + 9, mouth_y + 1)
-            painter.setBrush(Qt.BrushStyle.NoBrush)
-            painter.drawPath(path)
-        elif e == "cry":
-            painter.setBrush(Qt.BrushStyle.NoBrush)
-            path = QPainterPath()
-            path.moveTo(cx - 8, mouth_y + 5)
-            path.quadTo(cx, mouth_y - 3, cx + 8, mouth_y + 5)
-            painter.drawPath(path)
-            # Tears
-            painter.setPen(Qt.PenStyle.NoPen)
-            painter.setBrush(QColor("#4CC9F0"))
-            painter.drawEllipse(QRectF(cx - 25, eye_y + 9, 5, 11))
-            painter.drawEllipse(QRectF(cx + 20, eye_y + 9, 5, 11))
-        else:
-            # Cute cat 'w' smile
-            painter.setBrush(Qt.BrushStyle.NoBrush)
-            path = QPainterPath()
-            path.moveTo(cx - 7, mouth_y)
-            path.quadTo(cx - 3.5, mouth_y + 5, cx, mouth_y + 1)
-            path.quadTo(cx + 3.5, mouth_y + 5, cx + 7, mouth_y)
-            painter.drawPath(path)
+            self._draw_speech_bubble(painter, cx, char_y - draw_h - 6.0)
 
     def _draw_speech_bubble(self, painter: QPainter, cx: float, bottom_y: float):
         font = QFont("Segoe UI", 10, QFont.Weight.Bold)
         painter.setFont(font)
         metrics = QFontMetrics(font)
 
-        text_rect = metrics.boundingRect(QRectF(0, 0, 210, 80).toRect(), Qt.TextFlag.TextWordWrap, self.bubble_text)
+        text_rect = metrics.boundingRect(
+            QRectF(0, 0, 210, 80).toRect(),
+            Qt.TextFlag.TextWordWrap,
+            self.bubble_text
+        )
         pad_x, pad_y = 16.0, 10.0
-        bw = max(90.0, text_rect.width() + pad_x * 2)
+        bw = max(92.0, text_rect.width() + pad_x * 2)
         bh = max(36.0, text_rect.height() + pad_y * 2)
-        bx = cx - bw / 2.0
-        by = max(6.0, bottom_y - bh - 12.0)
+        bx = max(8.0, min(self.width() - bw - 8.0, cx - bw / 2.0))
+        by = max(6.0, bottom_y - bh - 10.0)
 
-        # Bubble shadow
+        # Bubble Drop Shadow
         painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(QColor(0, 0, 0, 70))
+        painter.setBrush(QColor(0, 0, 0, 75))
         painter.drawRoundedRect(QRectF(bx + 2, by + 4, bw, bh), 14.0, 14.0)
 
-        # Bubble body + triangular pointer tail
+        # Bubble Body + Pointer Tail
         bubble_path = QPainterPath()
         bubble_path.addRoundedRect(QRectF(bx, by, bw, bh), 14.0, 14.0)
 
+        tail_x = max(bx + 18.0, min(bx + bw - 18.0, cx))
         tail = QPainterPath()
-        tail.moveTo(cx - 8, by + bh - 1)
-        tail.lineTo(cx, by + bh + 10)
-        tail.lineTo(cx + 8, by + bh - 1)
+        tail.moveTo(tail_x - 8, by + bh - 1)
+        tail.lineTo(tail_x, by + bh + 10)
+        tail.lineTo(tail_x + 8, by + bh - 1)
         bubble_path = bubble_path.united(tail)
 
         painter.setPen(QPen(QColor("#1E1B2E"), 2.5))
         painter.setBrush(QColor("#FFFFFF"))
         painter.drawPath(bubble_path)
 
-        # Bubble text
+        # Bubble Text
         painter.setPen(QColor("#1E1B2E"))
         painter.drawText(
             QRectF(bx + pad_x / 2.0, by, bw - pad_x, bh),
@@ -366,12 +342,13 @@ if __name__ == "__main__":
     overlay.show()
 
     test_reactions = [
-        ("shock", "NO WAY BRO!"),
         ("laugh", "LMAOOO!"),
-        ("hype", "LET'S GOOO!"),
         ("scared", "RUN RIGHT NOW!"),
+        ("shock", "NO WAY BRO!"),
         ("cry", "NOT LIKE THIS..."),
-        ("confused", "WAIT WHAT?")
+        ("cringe", "BRO STOP..."),
+        ("confused", "WAIT WHAT?"),
+        ("hype", "LET'S GOOO!"),
     ]
     idx = 0
 
@@ -383,5 +360,5 @@ if __name__ == "__main__":
 
     t = QTimer()
     t.timeout.connect(cycle)
-    t.start(3800)
+    t.start(4000)
     sys.exit(app.exec())
